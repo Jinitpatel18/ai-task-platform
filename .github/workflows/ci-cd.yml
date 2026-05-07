@@ -1,0 +1,150 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task
+
+jobs:
+  # ── Lint ──────────────────────────────────────────────────
+  lint-backend:
+    name: Lint Backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      - name: Install deps
+        run: cd backend && npm ci
+      - name: Run ESLint
+        run: cd backend && npm run lint
+
+  lint-frontend:
+    name: Lint Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install deps
+        run: cd frontend && npm ci
+      - name: Run ESLint
+        run: cd frontend && npm run lint
+
+  # ── Build & Push Images ───────────────────────────────────
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint-backend, lint-frontend]
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "env_tag=latest" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "env_tag=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-backend:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE_PREFIX }}-backend:${{ steps.tag.outputs.env_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-worker:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE_PREFIX }}-worker:${{ steps.tag.outputs.env_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-frontend:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE_PREFIX }}-frontend:${{ steps.tag.outputs.env_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Update Infra Repo ─────────────────────────────────────
+  update-infra:
+    name: Update Infra Repository
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-platform-infra
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Determine overlay path
+        id: overlay
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "path=k8s/overlays/production" >> $GITHUB_OUTPUT
+          else
+            echo "path=k8s/overlays/staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image tags in kustomization
+        run: |
+          TAG=${{ needs.build-and-push.outputs.image_tag }}
+          cd infra/${{ steps.overlay.outputs.path }}
+          # Use kustomize to set new image tags
+          kustomize edit set image \
+            ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-backend=${{ secrets.DOCKERHUB_USERNAME }}/ai-task-backend:${TAG} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-worker=${{ secrets.DOCKERHUB_USERNAME }}/ai-task-worker:${TAG} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-frontend=${{ secrets.DOCKERHUB_USERNAME }}/ai-task-frontend:${TAG}
+
+      - name: Commit and push
+        run: |
+          cd infra
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "chore: update image tags to ${{ needs.build-and-push.outputs.image_tag }}"
+          git push
