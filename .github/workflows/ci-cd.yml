@@ -113,7 +113,7 @@ jobs:
       - name: Checkout infra repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-platform-infra
+          repository: Jinitpatel18/ai-task-platform-infra
           token: ${{ secrets.INFRA_REPO_TOKEN }}
           path: infra
 
